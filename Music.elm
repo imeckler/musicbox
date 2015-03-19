@@ -1,5 +1,6 @@
 module Music where
 
+import Keyboard
 import Debug
 import Piece
 import Piece.Infix(..)
@@ -24,21 +25,44 @@ import Char
 import Char (KeyCode)
 import Easing(..)
 
-type alias SoundCode = Maybe String
-type alias Context = { width : Float, height : Float }
-type alias State =
-  { seed : Random.Seed
+type alias Contextual a  = Context -> a
+type alias Stateful a    = State -> (a, State)
+type alias SoundCode     = Maybe String
+type alias Context       = { width : Float, height : Float }
+type alias State         = { seed : Random.Seed }
+type alias NoiseAndLight = { noise : SoundCode, light : Piece ForATime Form }
+type alias AppState      =
+  { state         : State
+  , filter        : Filter
+  , noiseAndLight : NoiseAndLight
   }
 
-type alias Filter = Context -> Piece Forever (Form -> Form)
+type alias Filter = Contextual (Piece Forever (Form -> Form))
 
 -- noise and light
-type alias Instrument = Context -> State -> (Piece ForATime Form, SoundCode, State)
+type alias Instrument = Contextual (Stateful NoiseAndLight)
 -- actual type should be 
 -- type alias Instrument = State -> (Piece ForATime (Context -> Form), SoundCode, State)
 
-sight x s               = (x, Nothing, s)
-sightAndSound x sound s = (x, Just sound, s)
+it'sAllAboutContext : Contextual Context
+it'sAllAboutContext ctx = ctx
+
+theContext : Context
+theContext = { width = 300, height = 300 }
+
+ignoreTheContext : a -> Contextual a
+ignoreTheContext x = \_ -> x
+
+don'tTouchThatState : a -> Stateful a
+don'tTouchThatState x = \s -> (x, s)
+
+idFilter = ignoreTheContext <| Piece.stayForever (\x -> x)
+
+silently x = {noise=Nothing, light=x}
+silentlyAndStatelessly = don'tTouchThatState << silently
+
+sightAndSound : Piece ForATime Form -> String -> Stateful NoiseAndLight
+sightAndSound x sound = don'tTouchThatState {noise=Just sound, light=x}
 
 withOpacity : Float -> Color.Color -> Color.Color
 withOpacity a c =
@@ -69,7 +93,7 @@ scintillatingLines ctx =
   List.repeat 10
     (List.foldr1 (<>) <| List.map (Piece.stayFor dur << mk) [0..3])
   |> List.foldr1 (<>)
-  |> sight
+  |> silentlyAndStatelessly
 
 scaleXY x y img = groupTransform (T.matrix x 0 0 y 0 0) [img]
 
@@ -111,19 +135,48 @@ theBand = Dict.fromList
   ]
 
 filters : Dict KeyCode Filter
-filters = Dict.fromList []
-
-initialState : State
-initialState = { seed = Random.initialSeed 0 }
+filters = Dict.fromList
+  [ (Char.toCode 'i', idFilter)
+  , (Char.toCode 'r', spinning)
+  , (Char.toCode 'g', gridulate)
+  ]
 
 sing x = [x]
 
-main = 
-  let w = 900 in
-  Piece.run (Time.every 30)
-    (let (blob, _, _) = theManifold {width=w, height=w} {seed=Random.initialSeed 0} in
-    Signal.constant (Piece.sustain (Piece.map (collage w w << sing) blob)))
+keys = Signal.map2 (,) Keyboard.ctrl Keyboard.keysDown |> Signal.map (Debug.watch "keyses")
+
+rest : Instrument
+rest = ignoreTheContext <| don'tTouchThatState <| silently <| Piece.stayFor 0 <| group []
+
+eternalNothingness = Piece.stayForever (group [])
+
+main =
+  let w = 300
+      initialState =
+        { state         = {seed = Random.initialSeed 0}
+        , noiseAndLight = {noise=Nothing, light=Piece.stayFor 0 (group [])}
+        , filter        = idFilter
+        }
+      update : (Bool, List KeyCode) -> AppState -> AppState
+      update (ctrl, ks) s = case ks of
+        []   -> s
+        k::_ ->
+          if ctrl
+          then {s | filter <- Maybe.withDefault s.filter (Dict.get k filters)}
+          else 
+            let (nl, st') = Maybe.withDefault rest (Dict.get k theBand) theContext s.state in
+            {s | state <- st', noiseAndLight <- nl}
+      stateSig = Signal.foldp update initialState keys
+      pics =
+        Signal.map (\s -> s.noiseAndLight.light) stateSig
+        |> Piece.layer (Time.every 30)
+        |> Signal.map (collage (floor theContext.width) (floor theContext.height))
+  in
+  pics
   {-
+  Piece.run (Time.every 30)
+    (let (nl, _) = shootingArrow {width=w, height=w} {seed=Random.initialSeed 0} in
+    Signal.constant (Piece.sustain (Piece.map (collage w w << sing) nl.light)))
   Signal.foldps (\k -> Maybe.withDefault (\s -> (group [], Nothing, s)) (Dict.get k))
     ((group [], Nothing), initialState)
   |> Signal.map (\(
@@ -156,7 +209,7 @@ theManifold ctx s =
       numPts           = 30
       samplesPerPt     = 10
       radius           = min ctx.width ctx.height / 2
-      dur              = 2 * second
+      dur              = 6 * second
       (ratesAndJitters, seed') =
         Random.generate (Random.list numPts <| Random.zip (Random.float 1.8 2) (randomJitter 20))
           s.seed
@@ -172,8 +225,9 @@ theManifold ctx s =
       blob  =
         Piece.for dur <| \t ->
           let pts =
+                let offset = 0 * second in
                 List.map (\(r', c, s, jit) ->
-                  let r_t = ease easeInExpo float 0 r' dur (t + 0.5 * second) + jit t in
+                  let r_t = ease easeInQuint float 0 r' dur (t + offset) + jit t in
                   (r_t * c, r_t * s))
                   ptDatas
               interped = interpolate2 Periodic pts
@@ -186,6 +240,22 @@ theManifold ctx s =
                 in
                 interped (pti + j / samplesPerPt))))
   in
-  (blob, whomp, {s | seed <- seed'})
+  ({noise=whomp, light=blob}, {s | seed <- seed'})
 
--- config
+-- flying through the air type whistle
+shootingArrow : Instrument
+shootingArrow ctx =
+  let arrow   = group
+        [ rect 20 3 |> filled Color.black
+        , ngon 3 5 |> filled Color.black |> moveX 10
+        ]
+      angle x = atan2 (-2 * ctx.height/((ctx.width/2)^2) * x) 1
+      xpos t  = ease linear float (-ctx.width/2) (ctx.width/2) dur t
+      ypos x  = -ctx.height / (ctx.width/2)^2 * x^2 + (ctx.height/2)
+      dur     = 2 * second
+  in
+  sightAndSound
+    (Piece.for dur (\t ->
+      let x = xpos t in arrow |> rotate (angle x) |> move (x, ypos x)))
+    "whistle"
+
